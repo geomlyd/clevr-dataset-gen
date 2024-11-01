@@ -9,6 +9,10 @@ from __future__ import print_function
 import math, sys, random, argparse, json, os, tempfile
 from datetime import datetime as dt
 from collections import Counter
+from trajectory import (
+    Trajectory, RandomizedTrajectoryCreator, Simple2DLinearTrajectory,
+    TrajectoryPath)
+from trajectory_utils import trajectories_closer_than
 
 """
 Renders random scenes using Blender, each with with a random number of objects;
@@ -44,7 +48,7 @@ if INSIDE_BLENDER:
 parser = argparse.ArgumentParser()
 
 # Input options
-parser.add_argument('--base_scene_blendfile', default='data/base_scene.blend',
+parser.add_argument('--base_scene_blendfile', default='data/base_scene_vids.blend',
     help="Base blender file on which all scenes are based; includes " +
           "ground plane, lights, and camera.")
 parser.add_argument('--properties_json', default='data/properties.json',
@@ -68,6 +72,8 @@ parser.add_argument('--min_objects', default=3, type=int,
     help="The minimum number of objects to place in each scene")
 parser.add_argument('--max_objects', default=10, type=int,
     help="The maximum number of objects to place in each scene")
+parser.add_argument('--max_num_moving_objects', default=4, type=int,
+    help="The maximum number of objects allowed to move in a scene")
 parser.add_argument('--min_dist', default=0.25, type=float,
     help="The minimum allowed distance between object centers")
 parser.add_argument('--margin', default=0.4, type=float,
@@ -98,11 +104,11 @@ parser.add_argument('--split', default='new',
 parser.add_argument('--output_image_dir', default='../output/images/',
     help="The directory where output images will be stored. It will be " +
          "created if it does not exist.")
-parser.add_argument('--output_scene_dir', default='../output/scenes/',
-    help="The directory where output JSON scene structures will be stored. " +
-         "It will be created if it does not exist.")
-parser.add_argument('--output_scene_file', default='../output/CLEVR_scenes.json',
-    help="Path to write a single JSON file containing all scene information")
+parser.add_argument('--output_gt_dir', default='../output/scenes/',
+    help="The directory where output movement ground truth JSONL "
+     "will be stored. It will be created if it does not exist.")
+parser.add_argument('--output_gt_jsonl', default='../output/movement_gt.jsonl',
+    help="Path to write a single JSONL file containing all movement ground truth")
 parser.add_argument('--output_blend_dir', default='output/blendfiles',
     help="The directory where blender scene files will be stored, if the " +
          "user requested that these files be saved using the " +
@@ -127,9 +133,9 @@ parser.add_argument('--use_gpu', default=0, type=int,
     help="Setting --use_gpu 1 enables GPU-accelerated rendering using CUDA. " +
          "You must have an NVIDIA GPU with the CUDA toolkit installed for " +
          "to work.")
-parser.add_argument('--width', default=320, type=int,
+parser.add_argument('--width', default=480, type=int,
     help="The width (in pixels) for the rendered images")
-parser.add_argument('--height', default=240, type=int,
+parser.add_argument('--height', default=360, type=int,
     help="The height (in pixels) for the rendered images")
 parser.add_argument('--key_light_jitter', default=1.0, type=float,
     help="The magnitude of random jitter to add to the key light position.")
@@ -159,21 +165,22 @@ def main(args):
   scene_template = '%s%%0%dd.json' % (prefix, num_digits)
   blend_template = '%s%%0%dd.blend' % (prefix, num_digits)
   img_template = os.path.join(args.output_image_dir, img_template)
-  scene_template = os.path.join(args.output_scene_dir, scene_template)
+  scene_template = os.path.join(args.output_gt_dir, scene_template)
   blend_template = os.path.join(args.output_blend_dir, blend_template)
 
   if not os.path.isdir(args.output_image_dir):
     os.makedirs(args.output_image_dir)
-  if not os.path.isdir(args.output_scene_dir):
-    os.makedirs(args.output_scene_dir)
+  if not os.path.isdir(args.output_gt_dir):
+    os.makedirs(args.output_gt_dir)
   if args.save_blendfiles == 1 and not os.path.isdir(args.output_blend_dir):
     os.makedirs(args.output_blend_dir)
   
   all_scene_paths = []
   for i in range(args.num_images):
     img_path = img_template % (i + args.start_idx)
-    scene_path = scene_template % (i + args.start_idx)
-    all_scene_paths.append(scene_path)
+    scene_path = os.path.join(args.output_gt_dir, args.output_gt_jsonl)
+    #scene_template % (i + args.start_idx)
+    #all_scene_paths.append(scene_path)
     blend_path = None
     if args.save_blendfiles == 1:
       blend_path = blend_template % (i + args.start_idx)
@@ -182,28 +189,28 @@ def main(args):
       num_objects=num_objects,
       output_index=(i + args.start_idx),
       output_split=args.split,
-      output_image=img_path,
+      output_video=img_path,
       output_scene=scene_path,
       output_blendfile=blend_path,
     )
 
   # After rendering all images, combine the JSON files for each scene into a
   # single JSON file.
-  all_scenes = []
-  for scene_path in all_scene_paths:
-    with open(scene_path, 'r') as f:
-      all_scenes.append(json.load(f))
-  output = {
-    'info': {
-      'date': args.date,
-      'version': args.version,
-      'split': args.split,
-      'license': args.license,
-    },
-    'scenes': all_scenes
-  }
-  with open(args.output_scene_file, 'w') as f:
-    json.dump(output, f)
+  # all_scenes = []
+  # for scene_path in all_scene_paths:
+  #   with open(scene_path, 'r') as f:
+  #     all_scenes.append(json.load(f))
+  # output = {
+  #   'info': {
+  #     'date': args.date,
+  #     'version': args.version,
+  #     'split': args.split,
+  #     'license': args.license,
+  #   },
+  #   'scenes': all_scenes
+  # }
+  # with open(args.output_gt_jsonl, 'w') as f:
+  #   json.dump(output, f)
 
 
 
@@ -211,7 +218,7 @@ def render_scene(args,
     num_objects=5,
     output_index=0,
     output_split='none',
-    output_image='render.png',
+    output_video='render.mp4',
     output_scene='render_json',
     output_blendfile=None,
   ):
@@ -227,7 +234,7 @@ def render_scene(args,
   # cannot be used.
   render_args = bpy.context.scene.render
   render_args.engine = "CYCLES"
-  render_args.filepath = output_image
+  render_args.filepath = output_video
   render_args.resolution_x = args.width
   render_args.resolution_y = args.height
   render_args.resolution_percentage = 100
@@ -255,7 +262,7 @@ def render_scene(args,
   scene_struct = {
       'split': output_split,
       'image_index': output_index,
-      'image_filename': os.path.basename(output_image),
+      'image_filename': os.path.basename(output_video),
       'objects': [],
       'directions': {},
   }
@@ -283,10 +290,11 @@ def render_scene(args,
   plane_left = (cam_left - cam_left.project(plane_normal)).normalized()
   plane_up = cam_up.project(plane_normal).normalized()
 
-
-  down_in_img_while_on_plane = plane_normal.cross(cam_left)
-  up_in_img_while_on_plane = -plane_normal.cross(cam_left)
-  left_in_img_while_on_plane = cam_left
+  left_in_img_while_on_plane = (
+    cam_left - (cam_left.dot(plane_normal))*plane_normal)
+  down_in_img_while_on_plane = (plane_normal.cross(
+    left_in_img_while_on_plane))
+  up_in_img_while_on_plane = -down_in_img_while_on_plane
   right_in_img_while_on_plane = -left_in_img_while_on_plane
 
   # Delete the plane; we only used it for normals anyway. The base scene file
@@ -312,52 +320,108 @@ def render_scene(args,
     for i in range(3):
       bpy.data.objects['Lamp_Fill'].location[i] += rand(args.fill_light_jitter)
 
-  # Now make some random objects
-  objects, blender_objects = add_random_objects(
-    scene_struct, num_objects, 2, args, camera, [
-      left_in_img_while_on_plane, right_in_img_while_on_plane,
-      up_in_img_while_on_plane, down_in_img_while_on_plane])
+  #all 8 compass directions
+  movement_dirs = [left_in_img_while_on_plane, 
+                   left_in_img_while_on_plane + up_in_img_while_on_plane,
+                   up_in_img_while_on_plane,
+                   up_in_img_while_on_plane + right_in_img_while_on_plane,
+                   right_in_img_while_on_plane,
+                   right_in_img_while_on_plane + down_in_img_while_on_plane,
+                   down_in_img_while_on_plane,
+                   left_in_img_while_on_plane + down_in_img_while_on_plane]
+  movement_names = ["left",
+                    "up and to the left",
+                    "up",
+                    "up and to the right",
+                    "right",
+                    "down and to the right",
+                    "down",
+                    "down and to the left"]
+  VIDEO_IN_SECS = 1
+  FPS = bpy.context.scene.render.fps
+  TOTAL_FRAMES = VIDEO_IN_SECS*FPS
+  MAX_DIST = 20
+  MIN_SPEED = MAX_DIST/(2*VIDEO_IN_SECS)
+  MAX_SPEED = MAX_DIST/VIDEO_IN_SECS
 
-  render_args.filepath = render_args.filepath
-  TOTAL_FRAMES = 48
-  DIST = 5
+  traj_creator = RandomizedTrajectoryCreator()
+  def _create_linear(mov_dir, name): #avoid late binding
+    return lambda speed: Simple2DLinearTrajectory(mov_dir, name, speed)
+  for name, mov_dir in zip(movement_names, movement_dirs):
+    traj_creator.register_trajectory_type(
+      name, _create_linear(mov_dir, name),
+      lambda : random.uniform(MIN_SPEED, MAX_SPEED))
+
+  num_moving_objects = random.randint(1, args.max_num_moving_objects)
+  # Now make some random objects
+  num_moving_objects = 4
+  objects, blender_objects = add_random_objects(
+    scene_struct, num_objects, num_moving_objects, args, camera, traj_creator,
+    FPS, TOTAL_FRAMES)
+
   bpy.context.scene.render.image_settings.file_format = 'FFMPEG'
   bpy.context.scene.render.ffmpeg.format = 'MPEG4'
-  bpy.context.scene.render.ffmpeg.codec = 'H264'  
+  bpy.context.scene.render.ffmpeg.codec = 'H264'
 
   for obj, obj_blender in zip(objects, blender_objects):
-    if(obj["movement_vector"] is not None):
-      move_along = obj["movement_vector"]
-      obj_coords = obj["3d_coords"]
-      start = Vector(obj_coords)
-      end = start + move_along*50
-      bpy.ops.curve.primitive_bezier_curve_add(location=start)
+    if(obj["path"] is not None):
+      p = obj["path"]
+      p.insert_in_blender_animations(obj_blender)
+
+      # Define the start and end points of the lines
+      # Calculate the distance and direction for the cylinder
+      # line_direction = start - end
+      # line_length = line_direction.length
+
+      # # Create a cylinder
+      # bpy.ops.mesh.primitive_cylinder_add(radius=0.02, depth=line_length, location=(0, 0, 0))
+
+      # # Get the cylinder object
+      # cylinder = bpy.context.object
+      # cylinder.name = "LineObject"
+
+      # # Move it to the midpoint of the start and end points
+      # cylinder.location = (start + end) / 2
+
+      # # Rotate the cylinder to align with the line direction
+      # cylinder.rotation_mode = 'QUATERNION'
+      # cylinder.rotation_quaternion = line_direction.to_track_quat('Z', 'Y')
+
+      # # Add material for color
+      # material = bpy.data.materials.new(name="LineMaterial")
+      # material.diffuse_color = (1, 0, 0)  # Red color
+      # cylinder.data.materials.append(material)
+
+      #bge.render.drawLine(start, end, [255, 50, 0])
+      #bpy.ops.curve.primitive_bezier_curve_add(location=start)
       # Get the active object (the curve we just created)
-      curve_obj = bpy.context.active_object
-      curve = curve_obj.data
+      #curve_obj = bpy.context.active_object
+      #curve = curve_obj.data
 
       # Set the end point of the Bezier curve
-      curve.splines[0].bezier_points[1].co = end
+      #curve.splines[0].bezier_points[1].co = end
 
       # Set the handle type to make it a straight line
-      curve.splines[0].bezier_points[1].handle_left_type = 'AUTO'
-      curve.splines[0].bezier_points[1].handle_right_type = 'AUTO'
+      #curve.splines[0].bezier_points[1].handle_left_type = 'AUTO'
+      #curve.splines[0].bezier_points[1].handle_right_type = 'AUTO'
 
       # Optionally, you can scale the curve to make it thicker
-      curve_obj.data.bevel_depth = 0.05  # Adjust thickness as needed
+      #curve_obj.data.bevel_depth = 0.05  # Adjust thickness as needed
 
       # Link the object to the current collection
-      #bpy.context.scene.objects.link(curve_obj)      
+      #bpy.context.scene.objects.link(curve_obj)
+      
 
-      start_loc = obj_blender.location.copy()
-      bpy.context.scene.frame_set(1)
-      obj_blender.location = start_loc
-      obj_blender.keyframe_insert(data_path="location", frame=1)
+      # start_loc = obj_blender.location.copy()
+      # bpy.context.scene.frame_set(1)
+      # obj_blender.location = start_loc
+      # obj_blender.keyframe_insert(data_path="location", frame=1)
 
-      end_loc = start_loc + (move_along).normalized()*DIST
-      bpy.context.scene.frame_set(TOTAL_FRAMES)
-      obj_blender.location = end_loc
-      obj_blender.keyframe_insert(data_path="location", frame=TOTAL_FRAMES)  
+      # end_loc = start_loc + (move_along).normalized()*DIST
+
+      # bpy.context.scene.frame_set(TOTAL_FRAMES)
+      # obj_blender.location = end_loc
+      # obj_blender.keyframe_insert(data_path="location", frame=TOTAL_FRAMES)  
 
   bpy.context.scene.frame_start = 1
   bpy.context.scene.frame_end = TOTAL_FRAMES
@@ -365,28 +429,46 @@ def render_scene(args,
 
 
   # Render the scene and dump the scene data structure
-  scene_struct['objects'] = objects
-  scene_struct['relationships'] = compute_all_relationships(scene_struct)
-  # while True:
-  #   try:
-  #     bpy.ops.render.render(write_still=True)
-  #     break
-  #   except Exception as e:
-  #     print(e)
-
-  #with open(output_scene, 'w') as f:
-  #  json.dump(scene_struct, f, indent=2)
+  movement_gt = compute_movement_ground_truth(objects)
+  assert (
+    num_moving_objects == len(movement_gt["moving_objects"])
+    and num_objects == num_moving_objects + len(movement_gt["still_objects"]))
+  
+  gt_complete = {
+    "video_name": render_args.filepath.split("/")[-1],
+    "num_objects": num_objects,
+    "num_moving_objects": num_moving_objects,
+    **movement_gt
+  }
+  f = open(output_scene, "a")
+  f.write(json.dumps(gt_complete) + "\n")
+  f.close()
 
   if output_blendfile is not None:
     bpy.ops.wm.save_as_mainfile(filepath=output_blendfile)
 
+def compute_movement_ground_truth(objects):
+  moving_objects = []
+  still_objects = []
+  for o in objects:
+    if(o["path"] is None):
+      still_objects.append({"color" : o["color"], "shape": o["shape"],
+                            "loc": [o["3d_coords"][0], o["3d_coords"][1]]})
+    else:
+      path = o["path"]
+      moving_objects.append({
+        "color": o["color"], "shape": o["shape"], 
+        "loc": [o["3d_coords"][0], o["3d_coords"][1]],
+        "path" : path.properties_as_dict()})
+  return {"still_objects": still_objects, "moving_objects": moving_objects}
 
 def add_random_objects(scene_struct, num_objects, num_moving_objects, args, 
-                       camera, movement_vectors_list):
+                       camera, traj_creator: RandomizedTrajectoryCreator,
+                       fps, total_frames):
   """
   Add random objects to the current blender scene. 
-  The first `num_moving_objects` to be added will be assigned a random
-  movement direction from `movement_vectors_list`, along which they will
+  The first `num_moving_objects` to be added will be assigned a 
+  randomized trajectory created by `traj_creator`, along which they will
   later be animated.
   """
 
@@ -409,6 +491,7 @@ def add_random_objects(scene_struct, num_objects, num_moving_objects, args,
   positions = []
   objects = []
   blender_objects = []
+  moving_object_shape_color_combos = set()
   for i in range(num_objects):
     # Choose a random size
     size_name, r = random.choice(size_mapping)
@@ -425,28 +508,46 @@ def add_random_objects(scene_struct, num_objects, num_moving_objects, args,
         for obj in blender_objects:
           utils.delete_object(obj)
         return add_random_objects(
-          scene_struct, num_objects, num_moving_objects, args, camera, 
-          movement_vectors_list)
-      x = random.uniform(-3, 3)
-      y = random.uniform(-3, 3)
+          scene_struct, num_objects, num_moving_objects, args, camera,
+          traj_creator, fps, total_frames)
+
+      if(i < num_moving_objects):
+        traj = traj_creator.create_random_trajectory()
+        x = random.uniform(-2, 2) #spawn moving objects closer to center
+        y = random.uniform(-2, 2)
+        path = traj.compute_trajectory_path(
+          Vector((x, y, r)), fps, total_frames) #scale r is used as z-value
+      else:
+        path = None
+        x = random.uniform(-4, 4)
+        y = random.uniform(-4, 4)
       # Check to make sure the new object is further than min_dist from all
       # other objects, and further than margin along the four cardinal directions
       dists_good = True
       margins_good = True
-      for (xx, yy, rr, movement_vec) in positions:
+      for (xx, yy, rr, other_path) in positions:
         
-        if(movement_vec is not None):
-          diff_vec = (x - xx, y - yy)
-          proj_len = diff_vec[0]*movement_vec[0] + diff_vec[1]*movement_vec[1]
-          closest = (
-            xx + movement_vec[0]*proj_len, yy + movement_vec[1]*proj_len)
-          
-          dist = math.sqrt(closest[0]*closest[0] + closest[1]*closest[1])
-          if(dist - r - rr < 0):
+        if(other_path is not None):
+          #check for intersection of the two movement paths
+          if(path is not None and trajectories_closer_than(path, other_path,
+                                                           r + rr)):
+            print("Two trajectories would intersect")
+            # print(path.path_points, other_path.path_points)
+            # print("I am called ", path.other_info_for_json["direction"],
+            #       path.path_points)
+            # exit(0)
+            dists_good = False
+            break
+          #create a dummy single-point trajectory to check if object
+          #obstructs movements
+          dummy_path = Simple2DLinearTrajectory(
+            Vector((1, 0, 0)), "dummy", 0).compute_trajectory_path(
+              Vector((x, y, r)), fps, total_frames)
+          if(trajectories_closer_than(dummy_path, other_path, r + rr)):
             print("Object would intersect movement trajectory")
             dists_good = False
             break
-        
+
         dx, dy = x - xx, y - yy
         dist = math.sqrt(dx * dx + dy * dy)
         if dist - r - rr < args.min_dist:
@@ -469,13 +570,21 @@ def add_random_objects(scene_struct, num_objects, num_moving_objects, args,
 
     # Choose random color and shape
     if shape_color_combos is None:
-      obj_name, obj_name_out = random.choice(object_mapping)
-      color_name, rgba = random.choice(list(color_name_to_rgba.items()))
+      def pick_obj_and_color():
+        return (random.choice(object_mapping), 
+                random.choice(list(color_name_to_rgba.items())))
     else:
-      obj_name_out, color_choices = random.choice(shape_color_combos)
-      color_name = random.choice(color_choices)
-      obj_name = [k for k, v in object_mapping if v == obj_name_out][0]
-      rgba = color_name_to_rgba[color_name]
+      def pick_obj_and_color():
+        obj_name_out, color_choices = random.choice(shape_color_combos)
+        color_name = random.choice(color_choices)
+        obj_name = [k for k, v in object_mapping if v == obj_name_out][0]
+        rgba = color_name_to_rgba[color_name]
+        return ((obj_name, obj_name_out), (color_name, rgba))
+    ((obj_name, obj_name_out), (color_name, rgba)) = pick_obj_and_color()
+    while((obj_name, color_name) in moving_object_shape_color_combos):
+      ((obj_name, obj_name_out), (color_name, rgba)) = pick_obj_and_color()  
+    if(traj is not None):
+      moving_object_shape_color_combos.add((obj_name, color_name))
 
     # For cube, adjust the size a bit
     if obj_name == 'Cube':
@@ -487,10 +596,8 @@ def add_random_objects(scene_struct, num_objects, num_moving_objects, args,
     # Actually add the object to the scene
     utils.add_object(args.shape_dir, obj_name, r, (x, y), theta=theta)
     obj = bpy.context.object
-    blender_objects.append(obj)
-    movement_vec = (random.choice(movement_vectors_list).normalized() 
-                    if i < num_moving_objects else None)    
-    positions.append((x, y, r, movement_vec))
+    blender_objects.append(obj)   
+    positions.append((x, y, r, path))
 
     # Attach a random material
     mat_name, mat_name_out = random.choice(material_mapping)
@@ -506,9 +613,7 @@ def add_random_objects(scene_struct, num_objects, num_moving_objects, args,
       'rotation': theta,
       'pixel_coords': pixel_coords,
       'color': color_name,
-      #check if the object needs to be animated later
-      'movement_vector': movement_vec
-
+      'path': path
     })
 
   # Check that all objects are at least partially visible in the rendered image
@@ -521,8 +626,8 @@ def add_random_objects(scene_struct, num_objects, num_moving_objects, args,
       utils.delete_object(obj)
     return add_random_objects(
       scene_struct, num_objects, num_moving_objects, args, camera, 
-      movement_vectors_list)
-
+      traj_creator, fps, total_frames) 
+  
   return objects, blender_objects
 
 
@@ -642,6 +747,7 @@ def render_shadeless(blender_objects, path='flat.png'):
 
 
 if __name__ == '__main__':
+  random.seed(222)
   if INSIDE_BLENDER:
     # Run normally
     argv = utils.extract_args()

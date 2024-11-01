@@ -7,8 +7,9 @@
 
 import sys, random, os
 import bpy, bpy_extras
-
-
+from mathutils import Vector
+import numpy as np
+from math import pi
 """
 Some utility functions for interacting with Blender
 """
@@ -170,3 +171,34 @@ def add_material(name, **properties):
       output_node.inputs['Surface'],
   )
 
+def intersection_of_lines(point1, dir1, point2, dir2):
+  line_angle = dir1.angle(dir2)
+  lines_intersect = not (
+    (abs(line_angle) < 1e-5) or (abs(line_angle - pi)) < 1e-5)
+  points_angle = Vector(point1).angle(Vector(point2))
+  test_for_same_line = (
+    (abs(points_angle) < 1e-5) or (abs(points_angle - pi)) < 1e-5)
+  
+  if(not lines_intersect and test_for_same_line):
+    return ((point1[0] + point2[0])/2, (point1[1] + point2[1])/2)
+  if(not lines_intersect):
+    return None
+
+  if(abs(dir1[0]) > 1e-5):
+    A_1 = - dir1[1]
+    B_1 = dir1[0]
+    C_1 = dir1[1]*point1[0] - dir1[0]*point1[1]
+  else:
+    A_1 = 1
+    B_1 = 0
+    C_1 = point1[0]
+  if(abs(dir2[0]) > 1e-5):
+    A_2 = - dir2[1]
+    B_2 = dir2[0]
+    C_2 = dir2[1]*point2[0] - dir2[0]*point2[1]
+  else:
+    A_2 = 1
+    B_2 = 0
+    C_2 = point2[0]
+  return ((B_1*C_2 - B_2*C_1)/(A_1*B_2 - A_2*B_1), 
+          (A_2*C_1 - A_1*C_2/(A_1*B_2 - A_2*B_1)))
