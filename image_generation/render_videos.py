@@ -11,7 +11,7 @@ from datetime import datetime as dt
 from collections import Counter
 from trajectory import (
     Trajectory, RandomizedTrajectoryCreator, Simple2DLinearTrajectory,
-    TrajectoryPath)
+    LinearTraj2DVariedTiming, TrajectoryPath, PiecewiseLinearTraj)
 from trajectory_utils import trajectories_closer_than
 
 """
@@ -84,7 +84,7 @@ parser.add_argument('--min_pixels_per_object', default=200, type=int,
     help="All objects will have at least this many visible pixels in the " +
          "final rendered images; this ensures that no objects are fully " +
          "occluded by other objects.")
-parser.add_argument('--max_retries', default=50, type=int,
+parser.add_argument('--max_retries', default=20, type=int,
     help="The number of times to try placing an object before giving up and " +
          "re-placing all objects in the scene.")
 
@@ -337,36 +337,91 @@ def render_scene(args,
                     "down and to the right",
                     "down",
                     "down and to the left"]
-  VIDEO_IN_SECS = 1
+  VIDEO_IN_SECS = 5
   FPS = bpy.context.scene.render.fps
   TOTAL_FRAMES = VIDEO_IN_SECS*FPS
-  MAX_DIST = 20
+  MAX_DIST = 15
   MIN_SPEED = MAX_DIST/(2*VIDEO_IN_SECS)
-  MAX_SPEED = MAX_DIST/VIDEO_IN_SECS
+  MAX_SPEED = 1.5*MAX_DIST/(VIDEO_IN_SECS)
+  MIN_NUM_PATH_PIECES = 2
+  MAX_NUM_PATH_PIECES = 3
 
   traj_creator = RandomizedTrajectoryCreator()
-  def _create_linear(mov_dir, name): #avoid late binding
+  #avoid late binding
+  def _create_linear(mov_dir, name): 
     return lambda speed: Simple2DLinearTrajectory(mov_dir, name, speed)
-  for name, mov_dir in zip(movement_names, movement_dirs):
-    traj_creator.register_trajectory_type(
-      name, _create_linear(mov_dir, name),
-      lambda : random.uniform(MIN_SPEED, MAX_SPEED))
+  def _create_linear_varied_timing(mov_dir, name):
+    return lambda speed, start_mult, end_mult: LinearTraj2DVariedTiming(
+      mov_dir, name, speed, start_mult, end_mult)
+  
+  def _randomize_piecewise_linear():
+    num_pieces = random.randint(MIN_NUM_PATH_PIECES, MAX_NUM_PATH_PIECES)
+    chosen_inds = [
+      random.choice(range(len(movement_dirs))) for _ in range(num_pieces)]
+    chosen_dirs = [movement_dirs[_] for _ in chosen_inds]
+    chosen_names = [movement_names[_] for _ in chosen_inds]
+    speeds = [random.uniform(MIN_SPEED, MAX_SPEED) for _ in chosen_dirs]
+    initial_mult = random.uniform(0, 0.3)
+    increments = [random.uniform(0.1, (1 - 0.3)/num_pieces) for _ in
+                  chosen_dirs]
+    start_mults = [initial_mult]
+    for i in increments:
+      start_mults.append(start_mults[-1] + i)
+    return ((), {"directions": chosen_dirs, "direction_names": chosen_names,
+                 "speeds_units_per_sec": speeds, 
+                 "piece_start_multipliers": start_mults})
+
+  # for name, mov_dir in zip(movement_names, movement_dirs):
+  #   traj_creator.register_trajectory_type(
+  #     name, _create_linear(mov_dir, name),
+  #     lambda : ((random.uniform(MIN_SPEED, MAX_SPEED),), {}))
+  #   traj_creator.register_trajectory_type(
+  #     name + "_varied", _create_linear_varied_timing(mov_dir, name),
+  #     lambda : ((), 
+  #               {"speed": random.uniform(MIN_SPEED, MAX_SPEED),
+  #                "start_mult": random.uniform(0, 0.4), 
+  #                "end_mult": random.uniform(0.6, 1)}))
+  traj_creator.register_trajectory_type(
+    "piecewise_linear", PiecewiseLinearTraj, _randomize_piecewise_linear)
 
   num_moving_objects = random.randint(1, args.max_num_moving_objects)
   # Now make some random objects
-  num_moving_objects = 4
   objects, blender_objects = add_random_objects(
     scene_struct, num_objects, num_moving_objects, args, camera, traj_creator,
     FPS, TOTAL_FRAMES)
+
+  #dump ground truth
+  movement_gt = compute_movement_ground_truth(objects)
+  assert (
+    num_moving_objects == len(movement_gt["moving_objects"])
+    and num_objects == num_moving_objects + len(movement_gt["still_objects"]))
+  
+  
+  gt_complete = {
+    "video_name": render_args.filepath.split("/")[-1],
+    "num_frames": TOTAL_FRAMES,
+    "fps": FPS,
+    "num_objects": num_objects,
+    "num_moving_objects": num_moving_objects,
+    **movement_gt
+  }
+  f = open(output_scene, "a")
+  f.write(json.dumps(gt_complete) + "\n")
+  f.close()    
 
   bpy.context.scene.render.image_settings.file_format = 'FFMPEG'
   bpy.context.scene.render.ffmpeg.format = 'MPEG4'
   bpy.context.scene.render.ffmpeg.codec = 'H264'
 
+  #Render the scene
   for obj, obj_blender in zip(objects, blender_objects):
     if(obj["path"] is not None):
       p = obj["path"]
       p.insert_in_blender_animations(obj_blender)
+      for fcurve in obj_blender.animation_data.action.fcurves:
+        if fcurve.data_path == "location":
+          for keyframe in fcurve.keyframe_points:
+            keyframe.interpolation = 'LINEAR'
 
       # Define the start and end points of the lines
       # Calculate the distance and direction for the cylinder
@@ -426,23 +481,6 @@ def render_scene(args,
   bpy.context.scene.frame_start = 1
   bpy.context.scene.frame_end = TOTAL_FRAMES
   bpy.ops.render.render(animation=True)
-
-
-  # Render the scene and dump the scene data structure
-  movement_gt = compute_movement_ground_truth(objects)
-  assert (
-    num_moving_objects == len(movement_gt["moving_objects"])
-    and num_objects == num_moving_objects + len(movement_gt["still_objects"]))
-  
-  gt_complete = {
-    "video_name": render_args.filepath.split("/")[-1],
-    "num_objects": num_objects,
-    "num_moving_objects": num_moving_objects,
-    **movement_gt
-  }
-  f = open(output_scene, "a")
-  f.write(json.dumps(gt_complete) + "\n")
-  f.close()
 
   if output_blendfile is not None:
     bpy.ops.wm.save_as_mainfile(filepath=output_blendfile)
@@ -519,8 +557,8 @@ def add_random_objects(scene_struct, num_objects, num_moving_objects, args,
           Vector((x, y, r)), fps, total_frames) #scale r is used as z-value
       else:
         path = None
-        x = random.uniform(-4, 4)
-        y = random.uniform(-4, 4)
+        x = random.uniform(-3.5, 3.5)
+        y = random.uniform(-3.5, 3.5)
       # Check to make sure the new object is further than min_dist from all
       # other objects, and further than margin along the four cardinal directions
       dists_good = True
@@ -532,7 +570,7 @@ def add_random_objects(scene_struct, num_objects, num_moving_objects, args,
           if(path is not None and trajectories_closer_than(path, other_path,
                                                            r + rr)):
             print("Two trajectories would intersect")
-            # print(path.path_points, other_path.path_points)
+            print(path.path_points, other_path.path_points, r + rr)
             # print("I am called ", path.other_info_for_json["direction"],
             #       path.path_points)
             # exit(0)
