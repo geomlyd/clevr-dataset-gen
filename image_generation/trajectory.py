@@ -6,7 +6,8 @@ import numpy as np
 import bpy
 from math import floor
 import json
-from typing import List, Tuple, Callable, Any, Dict
+from typing import List, Tuple, Callable, Any, Dict, Iterable
+from itertools import chain
 
 class TrajectoryPath:
     
@@ -116,29 +117,36 @@ class PiecewiseLinearTraj(Trajectory):
 
     def __init__(self, directions: List[Vector], direction_names: List[str],
                  speeds_units_per_sec: List[float], 
-                 piece_start_multipliers: List[float]):
+                 piece_start_multipliers: List[float],
+                 piece_end_multipliers: List[float]):
         """Constructs a trajectory that consists of subsequent linear
         paths, the i-th of which is on direction `directions[i]` with
         speed `speeds_units_per_sec[i]`, starts on `piece_start_multipliers[i]`
-        and `ends on piece_start_multipliers[i + 1]`, for `i = 0, 1, ..., n-1`,
+        and ends on `piece_end_multipliers[i]`, for `i = 0, 1, ..., n-1`,
         where `n` is the number of simple paths and 
         `n = len(directions) = len(direction_names) = len(speed_units_per_sec) 
-        = len(piece_start_multipliers) - 1`.
+        = len(piece_start_multipliers) = len(piece_end_multipliers)`.
 
         The multipliers should all be in [0, 1], since they represent
-        fractions of the total video length. They should also be given in
-        a non-descending order.
+        fractions of the total video length. Furthermore, the interleaved
+        list `piece_start[0], piece_end[0], piece_start[1], piece_end[1] ...`
+        should be in non-descending order (a difference between `piece_end[i]`
+        and `piece_start[i+1]` allows for a pause in movement).
         """
         if(len(direction_names) != len(directions) 
            or len(directions) != len(speeds_units_per_sec) 
-           or len(directions) != len(piece_start_multipliers) - 1):
+           or len(directions) != len(piece_start_multipliers)
+           or len(piece_start_multipliers) != len(piece_end_multipliers)):
             raise ValueError("Mismatch between the number of velocities, "
                              "speeds and number of paths.")
+        mults_interleaved = list(chain.from_iterable(
+            [[v[0], v[1]] for v in zip(piece_start_multipliers,
+                                       piece_end_multipliers)]))
         mults_sorted = all([
-            piece_start_multipliers[i] <= piece_start_multipliers[i + 1] 
-            for i in range(len(piece_start_multipliers) - 1)])
+            mults_interleaved[i] <= mults_interleaved[i + 1] 
+            for i in range(len(mults_interleaved) - 1)])
         all_mults_valid = all(
-            [_ >= 0 and _ <= 1 for _ in piece_start_multipliers])
+            [_ >= 0 and _ <= 1 for _ in mults_interleaved])
         if(not mults_sorted):
             raise ValueError("The times at which the object passes from "
                              "path endpoints are not in non-descending order.")
@@ -150,12 +158,13 @@ class PiecewiseLinearTraj(Trajectory):
         self.direction_names = direction_names
         self.speeds_units_per_sec = speeds_units_per_sec
         self.piece_start_multipliers = piece_start_multipliers
+        self.piece_end_multipliers = piece_end_multipliers
         self.trajectories = []
 
-        for i, (d, d_name, speed) in enumerate(zip(
-            directions, direction_names, speeds_units_per_sec)):
-            start = piece_start_multipliers[i]
-            end = piece_start_multipliers[i + 1]
+        for i, (d, d_name, speed, start, end) in enumerate(zip(
+            directions, direction_names, speeds_units_per_sec,
+            piece_start_multipliers, piece_end_multipliers)):
+
             self.trajectories.append(LinearTraj2DVariedTiming(
                 d, d_name, speed, start, end))
             
@@ -186,24 +195,29 @@ class RandomizedTrajectoryCreator:
 
     def __init__(self):
         self.known_trajectories = {}
-        self.arg_generators = {}
+        self.trajectories_to_sample_from = set({})
 
     def register_trajectory_type(
-            self, traj_name: str, traj_creator: Callable[[Any], Trajectory],
-            randomized_args_generator: Callable[[], Tuple[Tuple[Any], Dict]]):
-        """`randomized_args_generator` should return a tuple of the form
-        (args, kwargs), where args is a tuple and kwargs a dictionary
-        that will serve as arguments for `traj_creator`
+            self, traj_name: str, traj_randomizer: Callable[[], Trajectory]):
+        """`traj_randomizer` will create a randomized trajectory of the
+        type corresponding to `traj_name`.
         """
-        self.known_trajectories[traj_name] = traj_creator
-        self.arg_generators[traj_name] = randomized_args_generator
+        self.known_trajectories[traj_name] = traj_randomizer
 
     def create_randomized_trajectory(self, traj_name: str) -> Trajectory:
-        rand_args = self.arg_generators[traj_name]()
-        return self.known_trajectories[traj_name](
-            *rand_args[0], **rand_args[1])
+        return self.known_trajectories[traj_name]()
+    
+    def set_trajectory_types_to_sample_from(
+            self, already_known_traj_names: Iterable[str]):
+        self.trajectories_to_sample_from = list(set(already_known_traj_names))
+        if(len(self.trajectories_to_sample_from) == 0):
+            raise ValueError("No trajectory names have been provided for "
+                             "future sampling.")
     
     def create_random_trajectory(self) -> Trajectory:
-        traj_type = random.choice(list(self.known_trajectories.keys()))
+        if(len(self.trajectories_to_sample_from) == 0):
+            traj_type = random.choice(list(self.known_trajectories.keys()))
+        else:
+            traj_type = random.choice(list(self.trajectories_to_sample_from))
         #print("picking ", traj_type, self.known_trajectories[traj_type])
         return self.create_randomized_trajectory(traj_type)

@@ -9,10 +9,14 @@ from __future__ import print_function
 import math, sys, random, argparse, json, os, tempfile
 from datetime import datetime as dt
 from collections import Counter
+from typing import List, Dict, Any
+from datetime import datetime
+
 from trajectory import (
     Trajectory, RandomizedTrajectoryCreator, Simple2DLinearTrajectory,
     LinearTraj2DVariedTiming, TrajectoryPath, PiecewiseLinearTraj)
 from trajectory_utils import trajectories_closer_than
+from video_gen_config import VideoGenerationConfig
 
 """
 Renders random scenes using Blender, each with with a random number of objects;
@@ -45,6 +49,7 @@ if INSIDE_BLENDER:
     print("$VERSION is your Blender version (such as 2.78).")
     sys.exit(1)
 
+trajectory_creator = RandomizedTrajectoryCreator()
 parser = argparse.ArgumentParser()
 
 # Input options
@@ -72,8 +77,11 @@ parser.add_argument('--min_objects', default=3, type=int,
     help="The minimum number of objects to place in each scene")
 parser.add_argument('--max_objects', default=10, type=int,
     help="The maximum number of objects to place in each scene")
-parser.add_argument('--max_num_moving_objects', default=4, type=int,
-    help="The maximum number of objects allowed to move in a scene")
+parser.add_argument(
+  '--video_gen_config', 
+  default="../video_gen_cfgs/video_gen_cfg.json", type=str,
+  help="Path to .json file providing configuration parameters for video "
+  "generation.")
 parser.add_argument('--min_dist', default=0.25, type=float,
     help="The minimum allowed distance between object centers")
 parser.add_argument('--margin', default=0.4, type=float,
@@ -93,22 +101,20 @@ parser.add_argument('--start_idx', default=0, type=int,
     help="The index at which to start for numbering rendered images. Setting " +
          "this to non-zero values allows you to distribute rendering across " +
          "multiple machines and recombine the results later.")
-parser.add_argument('--num_images', default=5, type=int,
-    help="The number of images to render")
+parser.add_argument('--num_videos', default=5, type=int,
+    help="The number of videos to render")
 parser.add_argument('--filename_prefix', default='CLEVR',
-    help="This prefix will be prepended to the rendered images and JSON scenes")
+    help="This prefix will be prepended to the rendered videos.")
 parser.add_argument('--split', default='new',
     help="Name of the split for which we are rendering. This will be added to " +
          "the names of rendered images, and will also be stored in the JSON " +
          "scene structure for each image.")
-parser.add_argument('--output_image_dir', default='../output/images/',
-    help="The directory where output images will be stored. It will be " +
+parser.add_argument('--output_video_dir', default='../output/images/',
+    help="The directory where output videos will be stored. It will be " +
          "created if it does not exist.")
-parser.add_argument('--output_gt_dir', default='../output/scenes/',
-    help="The directory where output movement ground truth JSONL "
-     "will be stored. It will be created if it does not exist.")
-parser.add_argument('--output_gt_jsonl', default='../output/movement_gt.jsonl',
-    help="Path to write a single JSONL file containing all movement ground truth")
+parser.add_argument('--output_gt_jsonl', default='movement_gt.jsonl',
+    help="Filename fora single JSONL file containing all movement ground "
+    "truth. It will be placed inside --output_video_dir.")
 parser.add_argument('--output_blend_dir', default='output/blendfiles',
     help="The directory where blender scene files will be stored, if the " +
          "user requested that these files be saved using the " +
@@ -159,38 +165,58 @@ parser.add_argument('--render_tile_size', default=256, type=int,
          "while larger tile sizes may be optimal for GPU-based rendering.")
 
 def main(args):
-  num_digits = 6
-  prefix = '%s_%s_' % (args.filename_prefix, args.split)
-  img_template = '%s%%0%dd.mp4' % (prefix, num_digits)
-  scene_template = '%s%%0%dd.json' % (prefix, num_digits)
-  blend_template = '%s%%0%dd.blend' % (prefix, num_digits)
-  img_template = os.path.join(args.output_image_dir, img_template)
-  scene_template = os.path.join(args.output_gt_dir, scene_template)
-  blend_template = os.path.join(args.output_blend_dir, blend_template)
 
-  if not os.path.isdir(args.output_image_dir):
-    os.makedirs(args.output_image_dir)
-  if not os.path.isdir(args.output_gt_dir):
-    os.makedirs(args.output_gt_dir)
+  def _speed_calc_func(cfg_dict, value):
+    return cfg_dict["max_dist"]/(cfg_dict["video_len_in_secs"]*value)
+
+  video_gen_cfg_json = args.video_gen_config
+  # preprocess_cfg_vals_funcs = {}
+  # prefixes = [("trajectory_randomization_args", "linear_simple"),
+  #             ("trajectory_randomization_args", "linear_varied_timing"),
+  #             ("trajectory_randomization_args", "piecewise_linear")]
+  # for p in prefixes:
+  #   preprocess_cfg_vals_funcs[p + ("min_speed",)] = _speed_calc_func
+  #   preprocess_cfg_vals_funcs[p + ("max_speed",)] = _speed_calc_func
+
+  video_gen_cfg = VideoGenerationConfig.from_json_config(
+    video_gen_cfg_json)
+
+  if(os.path.isdir(args.output_video_dir) 
+     and len(os.listdir(args.output_video_dir)) > 0):
+    args.output_video_dir = (
+      args.output_video_dir + datetime.now()
+      .strftime("%d_%m_%Y_%H_%M_%s"))
+    print("Output directory for videos is non-empty. For safety, the actual "
+          "output directory will instead be {0}".format(args.output_video_dir))
+    
+  if not os.path.isdir(args.output_video_dir):
+    os.makedirs(args.output_video_dir)
   if args.save_blendfiles == 1 and not os.path.isdir(args.output_blend_dir):
     os.makedirs(args.output_blend_dir)
+
+  num_digits = 6
+  prefix = '%s_%s_' % (args.filename_prefix, args.split)
+  video_template = '%s%%0%dd.mp4' % (prefix, num_digits)
+  blend_template = '%s%%0%dd.blend' % (prefix, num_digits)
+  video_template = os.path.join(args.output_video_dir, video_template)
+  blend_template = os.path.join(args.output_blend_dir, blend_template)    
   
   all_scene_paths = []
-  for i in range(args.num_images):
-    img_path = img_template % (i + args.start_idx)
-    scene_path = os.path.join(args.output_gt_dir, args.output_gt_jsonl)
+  for i in range(args.num_videos):
+    video_path = video_template % (i + args.start_idx)
     #scene_template % (i + args.start_idx)
     #all_scene_paths.append(scene_path)
     blend_path = None
     if args.save_blendfiles == 1:
       blend_path = blend_template % (i + args.start_idx)
     num_objects = random.randint(args.min_objects, args.max_objects)
-    render_scene(args,
+    render_scene(
+      args,
+      video_gen_config=video_gen_cfg,
       num_objects=num_objects,
       output_index=(i + args.start_idx),
       output_split=args.split,
-      output_video=img_path,
-      output_scene=scene_path,
+      output_video=video_path,
       output_blendfile=blend_path,
     )
 
@@ -212,14 +238,92 @@ def main(args):
   # with open(args.output_gt_jsonl, 'w') as f:
   #   json.dump(output, f)
 
+def register_trajectory_types(
+    possible_directions: List[Vector],
+    direction_names: List[str],
+    trajectories_to_sample_from: List[str],
+    traj_type_to_rand_args: Dict[str, Dict[str, Any]]):
+  """Centralized point for associating names with trajectory types.
+  The `_make*` functions serve to instantiate the randomizers based on
+  keyword arguments provided by `traj_type_to_rand_args` (which can e.g.
+  come from some config).
+  """
+  def _make_linear_traj_randomizer(min_speed, max_speed):
 
+    def _randomize():
+      chosen_ind = random.choice(range(0, len(possible_directions) - 1))
+      chosen_direction = possible_directions[chosen_ind]
+      chosen_name = direction_names[chosen_ind]
+      speed = random.uniform(min_speed, max_speed)
+      return Simple2DLinearTrajectory(chosen_direction, chosen_name, speed)
 
-def render_scene(args,
+    return _randomize
+  
+  def _make_linear_traj_varied_timing_randomizer(
+      min_speed, max_speed, smallest_start_mult, largest_start_mult,
+      smallest_end_mult, largest_end_mult):
+    
+    def _randomize():
+      chosen_ind = random.choice(range(0, len(possible_directions) - 1))
+      chosen_direction = possible_directions[chosen_ind]
+      chosen_name = direction_names[chosen_ind]
+
+      speed = random.uniform(min_speed, max_speed)
+      start_mult = random.uniform(smallest_start_mult, largest_start_mult)
+      end_mult = random.uniform(smallest_end_mult, largest_end_mult)
+      return LinearTraj2DVariedTiming(chosen_direction, chosen_name,
+                                      speed, start_mult, end_mult)
+    return _randomize
+  
+  def _make_piecewise_linear_randomizer(
+      min_num_pieces, max_num_pieces, min_speed, max_speed):
+    
+    def _randomize():
+      num_pieces = random.randint(min_num_pieces, max_num_pieces)
+      chosen_inds = [
+        random.choice(range(len(possible_directions))) 
+        for _ in range(num_pieces)]
+      chosen_dirs = [possible_directions[_] for _ in chosen_inds]
+      chosen_names = [direction_names[_] for _ in chosen_inds]
+      speeds = [random.uniform(min_speed, max_speed) for _ in chosen_dirs]
+      initial_mult = random.uniform(0, 0.3)
+      increments = [random.uniform(0.1, (1 - 0.3)/num_pieces) for _ in
+                    range(num_pieces - 1)]
+      start_mults = [initial_mult]
+      for i in increments:
+        start_mults.append(start_mults[-1] + i)
+      end_mults = []
+      for i in range(len(start_mults) - 1):
+        s1 = start_mults[i]
+        s2 = start_mults[i + 1]
+        end_mults.append(random.uniform((s1 + s2)/2, s2))
+      end_mults.append(random.uniform((1 + start_mults[-1])/2, 1))
+
+      return PiecewiseLinearTraj(chosen_dirs, chosen_names, speeds,
+                                 start_mults, end_mults)
+    return _randomize
+  
+  trajectory_creator.register_trajectory_type(
+    "linear_simple",  
+    _make_linear_traj_randomizer(**traj_type_to_rand_args["linear_simple"]))
+  trajectory_creator.register_trajectory_type(
+    "linear_varied_timing", _make_linear_traj_varied_timing_randomizer(
+      **traj_type_to_rand_args["linear_varied_timing"]))
+  trajectory_creator.register_trajectory_type(
+    "piecewise_linear", _make_piecewise_linear_randomizer(
+      **traj_type_to_rand_args["piecewise_linear"]))
+  
+  if(trajectories_to_sample_from is not None):
+    trajectory_creator.set_trajectory_types_to_sample_from(
+      trajectories_to_sample_from)
+
+def render_scene(
+    args,
+    video_gen_config: VideoGenerationConfig,
     num_objects=5,
     output_index=0,
     output_split='none',
     output_video='render.mp4',
-    output_scene='render_json',
     output_blendfile=None,
   ):
 
@@ -337,58 +441,22 @@ def render_scene(args,
                     "down and to the right",
                     "down",
                     "down and to the left"]
-  VIDEO_IN_SECS = 5
-  FPS = bpy.context.scene.render.fps
-  TOTAL_FRAMES = VIDEO_IN_SECS*FPS
-  MAX_DIST = 15
-  MIN_SPEED = MAX_DIST/(2*VIDEO_IN_SECS)
-  MAX_SPEED = 1.5*MAX_DIST/(VIDEO_IN_SECS)
-  MIN_NUM_PATH_PIECES = 2
-  MAX_NUM_PATH_PIECES = 3
-
-  traj_creator = RandomizedTrajectoryCreator()
-  #avoid late binding
-  def _create_linear(mov_dir, name): 
-    return lambda speed: Simple2DLinearTrajectory(mov_dir, name, speed)
-  def _create_linear_varied_timing(mov_dir, name):
-    return lambda speed, start_mult, end_mult: LinearTraj2DVariedTiming(
-      mov_dir, name, speed, start_mult, end_mult)
   
-  def _randomize_piecewise_linear():
-    num_pieces = random.randint(MIN_NUM_PATH_PIECES, MAX_NUM_PATH_PIECES)
-    chosen_inds = [
-      random.choice(range(len(movement_dirs))) for _ in range(num_pieces)]
-    chosen_dirs = [movement_dirs[_] for _ in chosen_inds]
-    chosen_names = [movement_names[_] for _ in chosen_inds]
-    speeds = [random.uniform(MIN_SPEED, MAX_SPEED) for _ in chosen_dirs]
-    initial_mult = random.uniform(0, 0.3)
-    increments = [random.uniform(0.1, (1 - 0.3)/num_pieces) for _ in
-                  chosen_dirs]
-    start_mults = [initial_mult]
-    for i in increments:
-      start_mults.append(start_mults[-1] + i)
-    return ((), {"directions": chosen_dirs, "direction_names": chosen_names,
-                 "speeds_units_per_sec": speeds, 
-                 "piece_start_multipliers": start_mults})
+  register_trajectory_types(movement_dirs, movement_names, 
+                            video_gen_config.trajectories_to_sample_from,
+                            video_gen_config.trajectory_randomization_args)
+  bpy.context.scene.render.fps = video_gen_config.fps
 
-  # for name, mov_dir in zip(movement_names, movement_dirs):
-  #   traj_creator.register_trajectory_type(
-  #     name, _create_linear(mov_dir, name),
-  #     lambda : ((random.uniform(MIN_SPEED, MAX_SPEED),), {}))
-  #   traj_creator.register_trajectory_type(
-  #     name + "_varied", _create_linear_varied_timing(mov_dir, name),
-  #     lambda : ((), 
-  #               {"speed": random.uniform(MIN_SPEED, MAX_SPEED),
-  #                "start_mult": random.uniform(0, 0.4), 
-  #                "end_mult": random.uniform(0.6, 1)}))
-  traj_creator.register_trajectory_type(
-    "piecewise_linear", PiecewiseLinearTraj, _randomize_piecewise_linear)
-
-  num_moving_objects = random.randint(1, args.max_num_moving_objects)
+  num_moving_objects = random.randint(
+    video_gen_config.min_num_moving_objects, 
+    video_gen_config.max_num_moving_objects)
+  total_frames = math.ceil(
+    video_gen_config.video_len_in_secs*video_gen_config.fps)
   # Now make some random objects
   objects, blender_objects = add_random_objects(
-    scene_struct, num_objects, num_moving_objects, args, camera, traj_creator,
-    FPS, TOTAL_FRAMES)
+    scene_struct, num_objects, num_moving_objects, args, camera,
+    video_gen_config.fps, total_frames)
+  assert len(objects) == len(blender_objects) and len(objects) == num_objects
 
   #dump ground truth
   movement_gt = compute_movement_ground_truth(objects)
@@ -399,13 +467,11 @@ def render_scene(args,
   
   gt_complete = {
     "video_name": render_args.filepath.split("/")[-1],
-    "num_frames": TOTAL_FRAMES,
-    "fps": FPS,
     "num_objects": num_objects,
     "num_moving_objects": num_moving_objects,
     **movement_gt
   }
-  f = open(output_scene, "a")
+  f = open(os.path.join(args.output_video_dir, args.output_gt_jsonl), "a")
   f.write(json.dumps(gt_complete) + "\n")
   f.close()    
 
@@ -423,63 +489,8 @@ def render_scene(args,
           for keyframe in fcurve.keyframe_points:
             keyframe.interpolation = 'LINEAR'
 
-      # Define the start and end points of the lines
-      # Calculate the distance and direction for the cylinder
-      # line_direction = start - end
-      # line_length = line_direction.length
-
-      # # Create a cylinder
-      # bpy.ops.mesh.primitive_cylinder_add(radius=0.02, depth=line_length, location=(0, 0, 0))
-
-      # # Get the cylinder object
-      # cylinder = bpy.context.object
-      # cylinder.name = "LineObject"
-
-      # # Move it to the midpoint of the start and end points
-      # cylinder.location = (start + end) / 2
-
-      # # Rotate the cylinder to align with the line direction
-      # cylinder.rotation_mode = 'QUATERNION'
-      # cylinder.rotation_quaternion = line_direction.to_track_quat('Z', 'Y')
-
-      # # Add material for color
-      # material = bpy.data.materials.new(name="LineMaterial")
-      # material.diffuse_color = (1, 0, 0)  # Red color
-      # cylinder.data.materials.append(material)
-
-      #bge.render.drawLine(start, end, [255, 50, 0])
-      #bpy.ops.curve.primitive_bezier_curve_add(location=start)
-      # Get the active object (the curve we just created)
-      #curve_obj = bpy.context.active_object
-      #curve = curve_obj.data
-
-      # Set the end point of the Bezier curve
-      #curve.splines[0].bezier_points[1].co = end
-
-      # Set the handle type to make it a straight line
-      #curve.splines[0].bezier_points[1].handle_left_type = 'AUTO'
-      #curve.splines[0].bezier_points[1].handle_right_type = 'AUTO'
-
-      # Optionally, you can scale the curve to make it thicker
-      #curve_obj.data.bevel_depth = 0.05  # Adjust thickness as needed
-
-      # Link the object to the current collection
-      #bpy.context.scene.objects.link(curve_obj)
-      
-
-      # start_loc = obj_blender.location.copy()
-      # bpy.context.scene.frame_set(1)
-      # obj_blender.location = start_loc
-      # obj_blender.keyframe_insert(data_path="location", frame=1)
-
-      # end_loc = start_loc + (move_along).normalized()*DIST
-
-      # bpy.context.scene.frame_set(TOTAL_FRAMES)
-      # obj_blender.location = end_loc
-      # obj_blender.keyframe_insert(data_path="location", frame=TOTAL_FRAMES)  
-
   bpy.context.scene.frame_start = 1
-  bpy.context.scene.frame_end = TOTAL_FRAMES
+  bpy.context.scene.frame_end = total_frames
   bpy.ops.render.render(animation=True)
 
   if output_blendfile is not None:
@@ -501,13 +512,12 @@ def compute_movement_ground_truth(objects):
   return {"still_objects": still_objects, "moving_objects": moving_objects}
 
 def add_random_objects(scene_struct, num_objects, num_moving_objects, args, 
-                       camera, traj_creator: RandomizedTrajectoryCreator,
-                       fps, total_frames):
+                       camera, fps, total_frames):
   """
   Add random objects to the current blender scene. 
   The first `num_moving_objects` to be added will be assigned a 
-  randomized trajectory created by `traj_creator`, along which they will
-  later be animated.
+  randomized trajectory created by the module-global trajectory creator, 
+  along which they will later be animated.
   """
 
   # Load the property file
@@ -547,10 +557,10 @@ def add_random_objects(scene_struct, num_objects, num_moving_objects, args,
           utils.delete_object(obj)
         return add_random_objects(
           scene_struct, num_objects, num_moving_objects, args, camera,
-          traj_creator, fps, total_frames)
+          fps, total_frames)
 
       if(i < num_moving_objects):
-        traj = traj_creator.create_random_trajectory()
+        traj = trajectory_creator.create_random_trajectory()
         x = random.uniform(-2, 2) #spawn moving objects closer to center
         y = random.uniform(-2, 2)
         path = traj.compute_trajectory_path(
@@ -664,7 +674,7 @@ def add_random_objects(scene_struct, num_objects, num_moving_objects, args,
       utils.delete_object(obj)
     return add_random_objects(
       scene_struct, num_objects, num_moving_objects, args, camera, 
-      traj_creator, fps, total_frames) 
+      fps, total_frames) 
   
   return objects, blender_objects
 
@@ -785,7 +795,7 @@ def render_shadeless(blender_objects, path='flat.png'):
 
 
 if __name__ == '__main__':
-  random.seed(222)
+  random.seed(0)
   if INSIDE_BLENDER:
     # Run normally
     argv = utils.extract_args()

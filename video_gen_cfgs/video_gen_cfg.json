@@ -1,0 +1,31 @@
+{
+  "video_len_in_secs": 2,
+  "max_dist": 15,
+  "fps": 24,
+  "min_num_moving_objects": 1,
+  "max_num_moving_objects": 4,
+  "trajectory_randomization_args":
+  {
+    "linear_simple":
+    {
+      "min_speed": 1.5, 
+      "max_speed": 4.5
+    },
+    "linear_varied_timing":
+    {
+      "min_speed": 1.5,
+      "max_speed": 4.5,
+      "smallest_start_mult": 0,
+      "largest_start_mult": 0.4,
+      "smallest_end_mult": 0.6,
+      "largest_end_mult": 1
+    },
+    "piecewise_linear":
+    {
+      "min_num_pieces": 2,
+      "max_num_pieces": 3,
+      "min_speed": 1.5,
+      "max_speed": 4.5
+    }
+  }
+}
