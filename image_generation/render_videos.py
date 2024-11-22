@@ -11,6 +11,7 @@ from datetime import datetime as dt
 from collections import Counter
 from typing import List, Dict, Any
 from datetime import datetime
+import shutil
 
 from trajectory import (
     Trajectory, RandomizedTrajectoryCreator, Simple2DLinearTrajectory,
@@ -51,7 +52,9 @@ if INSIDE_BLENDER:
 
 trajectory_creator = RandomizedTrajectoryCreator()
 parser = argparse.ArgumentParser()
-
+#sometimes a setting for generating a scene with motion is *too* unfavorable
+#and will lead to stack overflow
+RECURSION_COUNTER = 0
 # Input options
 parser.add_argument('--base_scene_blendfile', default='data/base_scene_vids.blend',
     help="Base blender file on which all scenes are based; includes " +
@@ -180,6 +183,7 @@ def main(args):
 
   video_gen_cfg = VideoGenerationConfig.from_json_config(
     video_gen_cfg_json)
+  random.seed(video_gen_cfg.rng_seed)
 
   if(os.path.isdir(args.output_video_dir) 
      and len(os.listdir(args.output_video_dir)) > 0):
@@ -191,6 +195,8 @@ def main(args):
     
   if not os.path.isdir(args.output_video_dir):
     os.makedirs(args.output_video_dir)
+  shutil.copy(video_gen_cfg_json, os.path.join(
+    args.output_video_dir, "generation_config.json"))
   if args.save_blendfiles == 1 and not os.path.isdir(args.output_blend_dir):
     os.makedirs(args.output_blend_dir)
 
@@ -203,22 +209,28 @@ def main(args):
   
   all_scene_paths = []
   for i in range(args.num_videos):
-    video_path = video_template % (i + args.start_idx)
-    #scene_template % (i + args.start_idx)
-    #all_scene_paths.append(scene_path)
-    blend_path = None
-    if args.save_blendfiles == 1:
-      blend_path = blend_template % (i + args.start_idx)
-    num_objects = random.randint(args.min_objects, args.max_objects)
-    render_scene(
-      args,
-      video_gen_config=video_gen_cfg,
-      num_objects=num_objects,
-      output_index=(i + args.start_idx),
-      output_split=args.split,
-      output_video=video_path,
-      output_blendfile=blend_path,
-    )
+    status = False
+    while(not status):
+      video_path = video_template % (i + args.start_idx)
+      #scene_template % (i + args.start_idx)
+      #all_scene_paths.append(scene_path)
+      blend_path = None
+      if args.save_blendfiles == 1:
+        blend_path = blend_template % (i + args.start_idx)
+      num_objects = random.randint(args.min_objects, args.max_objects)
+      num_moving_objects = random.randint(
+        video_gen_cfg.min_num_moving_objects, 
+        min(num_objects, video_gen_cfg.max_num_moving_objects))    
+      status = render_scene(
+        args,
+        video_gen_config=video_gen_cfg,
+        num_objects=num_objects,
+        num_moving_objects=num_moving_objects,
+        output_index=(i + args.start_idx),
+        output_split=args.split,
+        output_video=video_path,
+        output_blendfile=blend_path,
+      )
 
   # After rendering all images, combine the JSON files for each scene into a
   # single JSON file.
@@ -251,7 +263,7 @@ def register_trajectory_types(
   def _make_linear_traj_randomizer(min_speed, max_speed):
 
     def _randomize():
-      chosen_ind = random.choice(range(0, len(possible_directions) - 1))
+      chosen_ind = random.choice(range(len(possible_directions)))
       chosen_direction = possible_directions[chosen_ind]
       chosen_name = direction_names[chosen_ind]
       speed = random.uniform(min_speed, max_speed)
@@ -264,7 +276,7 @@ def register_trajectory_types(
       smallest_end_mult, largest_end_mult):
     
     def _randomize():
-      chosen_ind = random.choice(range(0, len(possible_directions) - 1))
+      chosen_ind = random.choice(range(len(possible_directions)))
       chosen_direction = possible_directions[chosen_ind]
       chosen_name = direction_names[chosen_ind]
 
@@ -321,6 +333,7 @@ def render_scene(
     args,
     video_gen_config: VideoGenerationConfig,
     num_objects=5,
+    num_moving_objects=0,
     output_index=0,
     output_split='none',
     output_video='render.mp4',
@@ -447,23 +460,21 @@ def render_scene(
                             video_gen_config.trajectory_randomization_args)
   bpy.context.scene.render.fps = video_gen_config.fps
 
-  num_moving_objects = random.randint(
-    video_gen_config.min_num_moving_objects, 
-    video_gen_config.max_num_moving_objects)
   total_frames = math.ceil(
     video_gen_config.video_len_in_secs*video_gen_config.fps)
   # Now make some random objects
+  global RECURSION_COUNTER
+  RECURSION_COUNTER = 0
   objects, blender_objects = add_random_objects(
     scene_struct, num_objects, num_moving_objects, args, camera,
     video_gen_config.fps, total_frames)
-  assert len(objects) == len(blender_objects) and len(objects) == num_objects
+  if(len(objects) != num_objects): #scene generation failed
+    return False
+  
+  assert len(objects) == len(blender_objects)
 
   #dump ground truth
   movement_gt = compute_movement_ground_truth(objects)
-  assert (
-    num_moving_objects == len(movement_gt["moving_objects"])
-    and num_objects == num_moving_objects + len(movement_gt["still_objects"]))
-  
   
   gt_complete = {
     "video_name": render_args.filepath.split("/")[-1],
@@ -473,7 +484,12 @@ def render_scene(
   }
   f = open(os.path.join(args.output_video_dir, args.output_gt_jsonl), "a")
   f.write(json.dumps(gt_complete) + "\n")
-  f.close()    
+  f.close()
+  assert (
+    num_moving_objects == len(movement_gt["moving_objects"])
+    and num_objects == num_moving_objects + len(movement_gt["still_objects"])), \
+    str(num_moving_objects) + " moving, " + str(num_objects) + " total, gt " + \
+    movement_gt["moving_objects"] + movement_gt["still_objects"]  
 
   bpy.context.scene.render.image_settings.file_format = 'FFMPEG'
   bpy.context.scene.render.ffmpeg.format = 'MPEG4'
@@ -495,6 +511,8 @@ def render_scene(
 
   if output_blendfile is not None:
     bpy.ops.wm.save_as_mainfile(filepath=output_blendfile)
+
+  return True
 
 def compute_movement_ground_truth(objects):
   moving_objects = []
@@ -521,6 +539,10 @@ def add_random_objects(scene_struct, num_objects, num_moving_objects, args,
   """
 
   # Load the property file
+  global RECURSION_COUNTER
+  RECURSION_COUNTER += 1
+  if(RECURSION_COUNTER > 10): #tried ten times to generate a scene and failed
+    return [], []
   with open(args.properties_json, 'r') as f:
     properties = json.load(f)
     color_name_to_rgba = {}
@@ -795,7 +817,6 @@ def render_shadeless(blender_objects, path='flat.png'):
 
 
 if __name__ == '__main__':
-  random.seed(0)
   if INSIDE_BLENDER:
     # Run normally
     argv = utils.extract_args()
