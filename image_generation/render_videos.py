@@ -195,8 +195,9 @@ def main(args):
     
   if not os.path.isdir(args.output_video_dir):
     os.makedirs(args.output_video_dir)
-  shutil.copy(video_gen_cfg_json, os.path.join(
-    args.output_video_dir, "generation_config.json"))
+  with open(
+    os.path.join(args.output_video_dir, "generation_config.json"), "w") as f:
+    json.dump(video_gen_cfg.to_dict(), f, indent=2)
   if args.save_blendfiles == 1 and not os.path.isdir(args.output_blend_dir):
     os.makedirs(args.output_blend_dir)
 

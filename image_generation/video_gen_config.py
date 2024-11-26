@@ -1,5 +1,7 @@
 from typing import Dict, Any, Callable, Tuple, Union, List
 import json
+import sys
+import os
 import bpy
 
 class VideoGenerationConfig():
@@ -8,8 +10,13 @@ class VideoGenerationConfig():
                  min_num_moving_objects: int, max_num_moving_objects: int,
                  max_dist: int,
                  trajectory_randomization_args: Dict[str, Any],
+                 rng_seed: int=None,                 
                  trajectories_to_sample_from: List[str]=None):
         self.video_len_in_secs = video_len_in_secs
+        if(rng_seed is not None):
+            self.rng_seed = rng_seed
+        else:
+            self.rng_seed = int.from_bytes(os.urandom(4), sys.byteorder)
         self.max_dist = max_dist
         self.fps = fps
         self.fps = bpy.context.scene.render.fps
@@ -17,6 +24,17 @@ class VideoGenerationConfig():
         self.max_num_moving_objects = max_num_moving_objects
         self.trajectory_randomization_args = trajectory_randomization_args
         self.trajectories_to_sample_from = trajectories_to_sample_from
+
+    def to_dict(self) -> Dict:
+        return {
+            "rng_seed": self.rng_seed,
+            "max_dist": self.max_dist,
+            "fps": self.fps,
+            "min_num_moving_objects": self.min_num_moving_objects,
+            "max_num_moving_objects": self.max_num_moving_objects,
+            "trajectories_to_sample_from": self.trajectories_to_sample_from,
+            "trajectory_randomization_args": self.trajectory_randomization_args
+        }
 
     @classmethod
     def from_config_KVs(
